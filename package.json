@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "start": "node src/cli.js",
-    "check": "node --check src/cli.js && node --check src/alpaca.js && node --check src/fifo.js && node --check src/fx.js && node --check src/kap.js && node --check src/excel.js"
+    "check": "node --check src/cli.js && node --check src/accounts.js && node --check src/alpaca.js && node --check src/fifo.js && node --check src/fx.js && node --check src/kap.js && node --check src/excel.js"
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.3",

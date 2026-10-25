@@ -3,6 +3,7 @@
 const fs = require("fs/promises");
 const path = require("path");
 const { createAlpacaClient, getAllActivities, getAssetMetadata, getAlpacaEnvironment } = require("./alpaca");
+const { loadAccounts } = require("./accounts");
 const { buildRealizedSales } = require("./fifo");
 const { loadFxConverter } = require("./fx");
 const { buildAdjustedCashActivities, buildClassifier, enrichRealizedSales, summarize } = require("./kap");
@@ -30,10 +31,10 @@ async function main() {
   const outputDir = path.resolve(args.outputDir || "output");
   await fs.mkdir(outputDir, { recursive: true });
 
-  const alpaca = createAlpacaClient();
-  const alpacaEnvironment = getAlpacaEnvironment();
+  const accounts = await loadAccounts({ accountsPath: args.accounts });
+
   if (args.diagnoseAuth) {
-    await runAuthDiagnostic(alpaca, alpacaEnvironment);
+    await runAuthDiagnostic(accounts);
     return;
   }
 
@@ -41,90 +42,62 @@ async function main() {
 
   const fetchAfter = args.historyStart || "2000-01-01";
   const fetchUntil = `${year + 1}-01-15`;
-  const activities = await getAllActivities(alpaca, { after: fetchAfter, until: fetchUntil });
-  const yearActivities = activities.filter((activity) => activityYear(activity) === year);
 
-  const allTradeActivities = activities.filter(
-    (activity) => activity.activity_type === "FILL" && !isCryptoSymbol(activity.symbol)
-  );
-  const dividendLikeActivities = yearActivities.filter((activity) =>
-    ["DIV", "DIVCGL", "DIVCGS", "DIVROC", "DIVTXEX", "DIVFT", "DIVNRA", "DIVTW"].includes(
-      activity.activity_type
-    )
-  ).filter((activity) => !isCryptoSymbol(activity.symbol));
-  const feeActivities = yearActivities.filter((activity) =>
-    ["FEE", "CFEE", "PTC", "DIVFEE"].includes(activity.activity_type)
-  ).filter((activity) => !isCryptoSymbol(activity.symbol));
-  const adjustmentActivities = yearActivities.filter((activity) =>
-    ["JNLC", "JNL", "INT", "INTNRA", "INTTW", "MISC"].includes(activity.activity_type)
-  );
-
-  const fifoResult = buildRealizedSales(allTradeActivities, { reportYear: year });
-  const realizedSales = fifoResult.realizedSales.filter(
-    (sale) => activityYear({ transaction_time: sale.soldAt }) === year
-  );
-
-  const symbolSet = new Set([
-    ...realizedSales.map((sale) => sale.symbol),
-    ...dividendLikeActivities.map((activity) => activity.symbol).filter(Boolean),
-    ...feeActivities.map((activity) => activity.symbol).filter(Boolean),
-  ]);
-
-  const assetsBySymbol = new Map();
-  for (const symbol of symbolSet) {
-    const asset = await getAssetMetadata(alpaca, assetsBySymbol, symbol);
-    assetsBySymbol.set(symbol, asset);
+  const accountResults = [];
+  for (const account of accounts) {
+    const result = await collectAccount({
+      account,
+      year,
+      fx,
+      symbolOverrides,
+      fetchAfter,
+      fetchUntil,
+    });
+    accountResults.push(result);
   }
 
-  const classifySymbol = buildClassifier(symbolOverrides, assetsBySymbol);
+  const realizedSales = accountResults.flatMap((result) => result.realizedSales);
+  const dividends = accountResults.flatMap((result) => result.dividends);
+  const fees = accountResults.flatMap((result) => result.fees);
+  const adjustments = accountResults.flatMap((result) => result.adjustments);
 
-  const enrichedSales = enrichRealizedSales(realizedSales, fx, classifySymbol);
-  const dividends = buildAdjustedCashActivities(dividendLikeActivities, fx).map((item) => ({
-    ...item,
-    assetType: classifySymbol(item.symbol || "").type,
-    domestic: Boolean(classifySymbol(item.symbol || "").domestic),
-  }));
-  const fees = buildAdjustedCashActivities(feeActivities, fx).map((item) => ({
-    ...item,
-    assetType: classifySymbol(item.symbol || "").type,
-    domestic: Boolean(classifySymbol(item.symbol || "").domestic),
-  }));
-  const adjustments = buildAdjustedCashActivities(adjustmentActivities, fx).map((item) => ({
-    ...item,
-    assetType: classifySymbol(item.symbol || "").type,
-    domestic: Boolean(classifySymbol(item.symbol || "").domestic),
-  }));
-
-  const summary = summarize({
-    sales: enrichedSales,
-    dividends,
-    fees,
-    adjustments,
-  });
+  const totalSummary = summarize({ sales: realizedSales, dividends, fees, adjustments });
+  const totalUsdTotals = summarizeUsdTotals(realizedSales);
+  const totalCounts = sumCounts(accountResults);
+  const totalWarnings = accountResults.flatMap((result) =>
+    result.warnings.map((warning) => `[${result.name}] ${warning}`)
+  );
 
   const summaryPayload = {
     year,
     generatedAt: new Date().toISOString(),
-    counts: {
-      activitiesFetched: activities.length,
-      activitiesInTaxYear: yearActivities.length,
-      realizedSales: enrichedSales.length,
-      dividends: dividends.length,
-      fees: fees.length,
-      adjustments: adjustments.length,
-      fifoWarnings: fifoResult.warnings.length,
+    accounts: accountResults.map((result) => ({
+      name: result.name,
+      environment: result.environment,
+      counts: result.counts,
+      warnings: result.warnings,
+      summary: result.summary,
+      usdTotals: result.usdTotals,
+    })),
+    total: {
+      counts: totalCounts,
+      warnings: totalWarnings,
+      summary: totalSummary,
+      usdTotals: totalUsdTotals,
     },
+    counts: totalCounts,
     assumptions: [
-      "FIFO is reconstructed from Alpaca FILL activities within the fetched history window.",
+      "FIFO is reconstructed per account from Alpaca FILL activities within the fetched history window.",
       "USD amounts are converted to EUR with Bundesbank USD/EUR reference data.",
       "ETF detection is heuristic unless symbol-overrides.json is provided.",
       "Line 18 domestic capital income defaults to 0 unless overridden per symbol.",
       "Corporate actions and basis-changing events are not fully reconciled.",
       "Historical sell underflows before the report year are bridged with synthetic carry-in basis so they do not abort the current-year report.",
+      "Totals are the sum of all configured accounts. Each account is also reported separately.",
     ],
-    warnings: fifoResult.warnings,
-    summary,
-    usdTotals: summarizeUsdTotals(enrichedSales),
+    warnings: totalWarnings,
+    summary: totalSummary,
+    usdTotals: totalUsdTotals,
   };
 
   await fs.writeFile(
@@ -134,7 +107,7 @@ async function main() {
   );
   await fs.writeFile(
     path.join(outputDir, `${year}-realized-sales.json`),
-    JSON.stringify(enrichedSales, null, 2),
+    JSON.stringify(realizedSales, null, 2),
     "utf8"
   );
   await fs.writeFile(
@@ -146,10 +119,7 @@ async function main() {
     year,
     outputDir,
     summaryPayload,
-    realizedSales: enrichedSales,
-    dividends,
-    fees,
-    adjustments,
+    accounts: accountResults,
   });
   summaryPayload.outputFiles = {
     summaryJson: path.join(outputDir, `${year}-summary.json`),
@@ -164,6 +134,123 @@ async function main() {
   );
 
   process.stdout.write(`${JSON.stringify(summaryPayload, null, 2)}\n`);
+}
+
+async function collectAccount({ account, year, fx, symbolOverrides, fetchAfter, fetchUntil }) {
+  try {
+    const alpaca = createAlpacaClient(account);
+    const environment = getAlpacaEnvironment(account);
+
+    const activities = await getAllActivities(alpaca, { after: fetchAfter, until: fetchUntil });
+    const yearActivities = activities.filter((activity) => activityYear(activity) === year);
+
+    const allTradeActivities = activities.filter(
+      (activity) => activity.activity_type === "FILL" && !isCryptoSymbol(activity.symbol)
+    );
+    const dividendLikeActivities = yearActivities
+      .filter((activity) =>
+        ["DIV", "DIVCGL", "DIVCGS", "DIVROC", "DIVTXEX", "DIVFT", "DIVNRA", "DIVTW"].includes(
+          activity.activity_type
+        )
+      )
+      .filter((activity) => !isCryptoSymbol(activity.symbol));
+    const feeActivities = yearActivities
+      .filter((activity) => ["FEE", "CFEE", "PTC", "DIVFEE"].includes(activity.activity_type))
+      .filter((activity) => !isCryptoSymbol(activity.symbol));
+    const adjustmentActivities = yearActivities.filter((activity) =>
+      ["JNLC", "JNL", "INT", "INTNRA", "INTTW", "MISC"].includes(activity.activity_type)
+    );
+
+    const fifoResult = buildRealizedSales(allTradeActivities, { reportYear: year });
+    const realizedSales = fifoResult.realizedSales
+      .filter((sale) => activityYear({ transaction_time: sale.soldAt }) === year)
+      .map((sale) => ({ ...sale, account: account.name }));
+
+    const symbolSet = new Set([
+      ...realizedSales.map((sale) => sale.symbol),
+      ...dividendLikeActivities.map((activity) => activity.symbol).filter(Boolean),
+      ...feeActivities.map((activity) => activity.symbol).filter(Boolean),
+    ]);
+
+    const assetsBySymbol = new Map();
+    for (const symbol of symbolSet) {
+      const asset = await getAssetMetadata(alpaca, assetsBySymbol, symbol);
+      assetsBySymbol.set(symbol, asset);
+    }
+
+    const classifySymbol = buildClassifier(symbolOverrides, assetsBySymbol);
+
+    const enrichedSales = enrichRealizedSales(realizedSales, fx, classifySymbol);
+    const dividends = buildAdjustedCashActivities(dividendLikeActivities, fx).map((item) => ({
+      ...item,
+      account: account.name,
+      assetType: classifySymbol(item.symbol || "").type,
+      domestic: Boolean(classifySymbol(item.symbol || "").domestic),
+    }));
+    const fees = buildAdjustedCashActivities(feeActivities, fx).map((item) => ({
+      ...item,
+      account: account.name,
+      assetType: classifySymbol(item.symbol || "").type,
+      domestic: Boolean(classifySymbol(item.symbol || "").domestic),
+    }));
+    const adjustments = buildAdjustedCashActivities(adjustmentActivities, fx).map((item) => ({
+      ...item,
+      account: account.name,
+      assetType: classifySymbol(item.symbol || "").type,
+      domestic: Boolean(classifySymbol(item.symbol || "").domestic),
+    }));
+
+    const summary = summarize({
+      sales: enrichedSales,
+      dividends,
+      fees,
+      adjustments,
+    });
+
+    return {
+      name: account.name,
+      environment,
+      counts: {
+        activitiesFetched: activities.length,
+        activitiesInTaxYear: yearActivities.length,
+        realizedSales: enrichedSales.length,
+        dividends: dividends.length,
+        fees: fees.length,
+        adjustments: adjustments.length,
+        fifoWarnings: fifoResult.warnings.length,
+      },
+      warnings: fifoResult.warnings,
+      summary,
+      usdTotals: summarizeUsdTotals(enrichedSales),
+      realizedSales: enrichedSales,
+      dividends,
+      fees,
+      adjustments,
+    };
+  } catch (error) {
+    error.message = `Account "${account.name}": ${error.message}`;
+    throw error;
+  }
+}
+
+function sumCounts(results) {
+  const totals = {
+    activitiesFetched: 0,
+    activitiesInTaxYear: 0,
+    realizedSales: 0,
+    dividends: 0,
+    fees: 0,
+    adjustments: 0,
+    fifoWarnings: 0,
+  };
+
+  for (const result of results) {
+    for (const key of Object.keys(totals)) {
+      totals[key] += result.counts[key] || 0;
+    }
+  }
+
+  return totals;
 }
 
 function summarizeUsdTotals(sales) {
@@ -261,6 +348,12 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (current === "--accounts") {
+      args.accounts = next;
+      i += 1;
+      continue;
+    }
+
     if (current === "--symbol-overrides") {
       args.symbolOverrides = next;
       i += 1;
@@ -301,58 +394,74 @@ async function loadJsonFile(filePath) {
 function printHelp() {
   process.stdout.write(
     [
-      "Usage: node src/cli.js --year 2025 [--symbol-overrides ./symbol-overrides.json] [--output-dir ./output] [--history-start 2000-01-01]",
+      "Usage: node src/cli.js --year 2025 [--accounts ./accounts.json] [--symbol-overrides ./symbol-overrides.json] [--output-dir ./output] [--history-start 2000-01-01]",
       "       node src/cli.js --year 2025 --diagnose-auth",
       "",
-      "Environment:",
-      "  ALPACA_KEY_ID",
-      "  ALPACA_SECRET_KEY",
-      "  ALPACA_PAPER=false",
+      "Accounts:",
+      "  Single account: ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_PAPER",
+      "  Multiple via env: ALPACA_ACCOUNTS=account1,account2 plus ALPACA_ACCOUNT1_KEY_ID / ALPACA_ACCOUNT1_SECRET_KEY and ALPACA_ACCOUNT2_KEY_ID / ALPACA_ACCOUNT2_SECRET_KEY",
+      "  Multiple via file: --accounts ./accounts.json",
     ].join("\n") + "\n"
   );
 }
 
-async function runAuthDiagnostic(alpaca, alpacaEnvironment) {
+async function runAuthDiagnostic(accounts) {
   const diagnostics = {
     generatedAt: new Date().toISOString(),
-    alpacaEnvironment,
-    env: {
-      hasKeyId: Boolean(process.env.ALPACA_KEY_ID),
-      keyIdLength: (process.env.ALPACA_KEY_ID || "").length,
-      hasSecretKey: Boolean(process.env.ALPACA_SECRET_KEY),
-      secretKeyLength: (process.env.ALPACA_SECRET_KEY || "").length,
-      paperRaw: process.env.ALPACA_PAPER,
-    },
+    accounts: [],
   };
 
-  try {
-    const account = await alpaca.getAccount();
-    diagnostics.getAccount = {
-      ok: true,
-      accountNumberSuffix: String(account.account_number || "").slice(-4),
-      status: account.status || null,
-      currency: account.currency || null,
+  for (const account of accounts) {
+    const entry = {
+      name: account.name,
+      environment: getAlpacaEnvironment(account),
+      env: {
+        hasKeyId: Boolean(account.keyId),
+        keyIdLength: (account.keyId || "").length,
+        hasSecretKey: Boolean(account.secretKey),
+        secretKeyLength: (account.secretKey || "").length,
+        paper: Boolean(account.paper),
+      },
     };
-  } catch (error) {
-    diagnostics.getAccount = serializeError(error);
-    process.stdout.write(`${JSON.stringify(diagnostics, null, 2)}\n`);
-    return;
-  }
 
-  try {
-    const activities = await alpaca.getAccountActivities({
-      direction: "desc",
-      pageSize: 1,
-    });
-    diagnostics.getAccountActivities = {
-      ok: true,
-      count: Array.isArray(activities) ? activities.length : null,
-      sampleActivityType: Array.isArray(activities) && activities[0] ? activities[0].activity_type : null,
-    };
-  } catch (error) {
-    diagnostics.getAccountActivities = serializeError(error);
-    process.stdout.write(`${JSON.stringify(diagnostics, null, 2)}\n`);
-    return;
+    let alpaca;
+    try {
+      alpaca = createAlpacaClient(account);
+    } catch (error) {
+      entry.createClient = serializeError(error);
+      diagnostics.accounts.push(entry);
+      continue;
+    }
+
+    try {
+      const alpacaAccount = await alpaca.getAccount();
+      entry.getAccount = {
+        ok: true,
+        accountNumberSuffix: String(alpacaAccount.account_number || "").slice(-4),
+        status: alpacaAccount.status || null,
+        currency: alpacaAccount.currency || null,
+      };
+    } catch (error) {
+      entry.getAccount = serializeError(error);
+      diagnostics.accounts.push(entry);
+      continue;
+    }
+
+    try {
+      const activities = await alpaca.getAccountActivities({
+        direction: "desc",
+        pageSize: 1,
+      });
+      entry.getAccountActivities = {
+        ok: true,
+        count: Array.isArray(activities) ? activities.length : null,
+        sampleActivityType: Array.isArray(activities) && activities[0] ? activities[0].activity_type : null,
+      };
+    } catch (error) {
+      entry.getAccountActivities = serializeError(error);
+    }
+
+    diagnostics.accounts.push(entry);
   }
 
   process.stdout.write(`${JSON.stringify(diagnostics, null, 2)}\n`);

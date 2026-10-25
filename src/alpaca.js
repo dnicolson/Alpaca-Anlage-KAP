@@ -1,10 +1,9 @@
 const Alpaca = require("@alpacahq/alpaca-trade-api");
 
-function createAlpacaClient() {
-  const keyId = process.env.ALPACA_KEY_ID;
-  const secretKey = process.env.ALPACA_SECRET_KEY;
-  const paper = String(process.env.ALPACA_PAPER || "false").toLowerCase() === "true";
-  const baseUrl = paper ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
+function createAlpacaClient(credentials = {}) {
+  const keyId = credentials.keyId || process.env.ALPACA_KEY_ID;
+  const secretKey = credentials.secretKey || process.env.ALPACA_SECRET_KEY;
+  const { paper, baseUrl } = getAlpacaEnvironment(credentials);
 
   if (!keyId || !secretKey) {
     throw new Error("Missing ALPACA_KEY_ID or ALPACA_SECRET_KEY in environment.");
@@ -18,8 +17,9 @@ function createAlpacaClient() {
   });
 }
 
-function getAlpacaEnvironment() {
-  const paper = String(process.env.ALPACA_PAPER || "false").toLowerCase() === "true";
+function getAlpacaEnvironment(credentials = {}) {
+  const rawPaper = credentials.paper != null ? credentials.paper : process.env.ALPACA_PAPER;
+  const paper = String(rawPaper || "false").toLowerCase() === "true";
   return {
     paper,
     baseUrl: paper ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets",
